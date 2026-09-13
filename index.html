@@ -82,6 +82,14 @@ code{font-family:var(--mono);font-size:.88em;background:var(--soft);border:1px s
 .doc th,.doc td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
 .doc th{background:var(--soft);font-weight:500}
 
+/* 取回保密资源时的浮层提示 */
+.toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,14px);z-index:60;
+  max-width:82vw;padding:9px 17px;border-radius:999px;background:#141a23;color:#fff;
+  font-size:13px;line-height:1.4;text-align:center;pointer-events:none;
+  opacity:0;transition:opacity .2s,transform .2s}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+.toast.bad{background:var(--danger)}
+
 /* 门禁页 */
 .gate{max-width:620px;margin:0 auto;padding:56px 20px 90px}
 .gate h1{font-size:23px;font-weight:500;margin:0 0 10px;letter-spacing:-.01em}
@@ -139,6 +147,20 @@ const CONFIG = {
      注意：这只影响资源去哪取，不影响内容保密 —— 内容仓库里的 HTML 依然是私有的。 */
   resourceBase: 'https://bjtu-guitar-association.github.io/.github.io/',
 
+  /* 内站页面里的「保密资源」前缀。
+     src/href 写成 @private/xxx 时，外壳会带着令牌从内容仓库把文件取回来，
+     再用 blob 交给页面 —— 字节只存在于当前页面内存里，
+     公开站和公开仓库里都不会有它。
+       <img src="@private/a.png">   → 页面载入后自动取回并替换
+       <a href="@private/b.docx">   → 点击时取回并下载，不跳转、地址栏不留痕
+     与之相对：写相对路径（assets/x.jpg）的，走上面的 resourceBase，从公开站取。 */
+  privatePrefix: '@private/',
+
+  /* 内站页面里的「跨页跳转」前缀。
+     iframe 里的 #/xxx 会被浏览器当成它自己的页内锚点，走不到外壳的路由，
+     所以内站 HTML 里要跳到另一个内站页面，必须写成 #__page/xxx.html。 */
+  pagePrefix: '#__page/',
+
   tokenKey: 'ghgate.token.v1',
   cachePrefix: 'ghgate.cache.',
   cacheTtl: 5 * 60 * 1000
@@ -148,7 +170,7 @@ const API = 'https://api.github.com';
 const stage = document.getElementById('stage');
 const bar = document.getElementById('bar');
 
-let STATE = { token: null, login: null, site: null, path: null, cache: new Map() };
+let STATE = { token: null, login: null, site: null, path: null, cache: new Map(), blobs: [] };
 
 /* ---------- 小工具 ---------- */
 const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -187,10 +209,14 @@ function renderMd(src){
   t = t.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   t = t.replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
   t = t.replace(/(?<![*\w])\*([^\s*](?:[^*\n]*[^\s*])?)\*(?![*\w])/g, '<em>$1</em>');
-  t = t.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt, src) =>
-    /^(https?:|\/)/i.test(src) ? '<img src="'+src+'" alt="'+alt+'">' : alt);
+  t = t.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt, src) => {
+    const pv = privatePath(src);
+    // 保密图片：同样不能留在 src 上（一进 DOM 就发请求），挂到 data-private
+    if (pv !== null) return '<img data-private="'+attrEsc(pv)+'" data-private-attr="src" alt="'+alt+'">';
+    return /^(https?:|\/)/i.test(src) ? '<img src="'+src+'" alt="'+alt+'">' : alt;
+  });
   t = t.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, (m, txt, href) => {
-    const safe = /^(https?:|\/|#|mailto:)/i.test(href) ? href : '#';
+    const safe = /^(https?:|\/|#|mailto:|@private\/)/i.test(href) ? href : '#';
     return '<a href="'+safe+'" target="_blank" rel="noopener noreferrer">' + (txt || href) + '</a>';
   });
 
@@ -274,6 +300,19 @@ function renderMd(src){
 /* ==========================================================================
    GitHub API
    ========================================================================== */
+/* 把仓库里的路径拼成接口 URL 时，必须「先解码、再编码」。
+   原因：主站 HTML 里的引用本来就是 %20 这种已编码写法，若直接 encodeURIComponent，
+   百分号会被再编一次（%20 变成 %2520），接口直接 404。
+   已用真实仓库实测确认：logo%20GA.png → 200，logo%2520GA.png → 404。 */
+function encSeg(seg){
+  let v = String(seg);
+  try { v = decodeURIComponent(v); } catch (e) { /* 含裸 % 的罕见文件名，保持原样 */ }
+  return encodeURIComponent(v);
+}
+function encPath(p){
+  return String(p).split('/').map(encSeg).join('/');
+}
+
 async function gh(path, token){
   const res = await fetch(API + path, {
     headers: {
@@ -315,7 +354,7 @@ async function fetchFile(path, token){
   }
 
   const url = '/repos/' + CONFIG.owner + '/' + CONFIG.repo + '/contents/'
-            + path.split('/').map(encodeURIComponent).join('/')
+            + encPath(path)
             + '?ref=' + encodeURIComponent(CONFIG.branch);
   const r = await gh(url, token);
 
@@ -483,30 +522,202 @@ function renderDocs(){
   loadDoc(cur);
 }
 
+/* ==========================================================================
+   保密资源 · 跨页跳转
+   --------------------------------------------------------------------------
+   内站 HTML 里只有两种写法，没有第三种，不要自创：
+
+   ① 公开资源（留在公开站上的图片、附件）
+        src="assets/images/x.jpg"            相对路径，外壳自动补 resourceBase
+   ② 保密资源（只放在内容仓库里的文件）
+        src="@private/assets/xxx.png"        外壳带令牌取回，用 blob 交给页面
+        href="@private/assets/xxx.docx"      点击时取回并下载
+
+   为什么保密资源不能直接写 src：<img> 一进 DOM 就会发请求，
+   而公开站上根本没有这个文件 —— 会先产生一次注定 404 的请求。
+   所以 rewriteRefs 会把 src 上的 @private 摘下来挂到 data-private，
+   等这里带令牌取回后再填回去。<a href> 不点不发请求，原样保留即可。
+
+   ③ 跨页跳转（内站有多个页面时）
+        href="#__page/forms.html"           交给外壳的路由切换页面
+      iframe 里的 #/xxx 会被当成它自己的页内锚点，走不到外壳路由，必须用 #__page/。
+   ========================================================================== */
+function attrEsc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
+
+function mimeOf(name){
+  const e = String(name).split('.').pop().toLowerCase();
+  return {
+    jpg:'image/jpeg', jpeg:'image/jpeg', jpe:'image/jpeg', png:'image/png',
+    gif:'image/gif', webp:'image/webp', svg:'image/svg+xml', bmp:'image/bmp',
+    avif:'image/avif', ico:'image/x-icon', pdf:'application/pdf'
+  }[e] || '';
+}
+
+/* api.github.com 的 raw 媒体类型直接给原始字节，图片和文档都能取，且不受 1MB 限制 */
+async function ghBlob(path, token){
+  const url = '/repos/' + CONFIG.owner + '/' + CONFIG.repo + '/contents/'
+            + encPath(path)
+            + '?ref=' + encodeURIComponent(CONFIG.branch);
+  const res = await fetch(API + url, {
+    headers: { 'Authorization': 'Bearer ' + token,
+               'Accept': 'application/vnd.github.raw+json' },
+    cache: 'no-store'
+  });
+  if (!res.ok) return { ok: false, status: res.status };
+  const raw = await res.blob();
+  const t = mimeOf(path) || (raw.type && raw.type !== 'application/octet-stream' ? raw.type : 'application/octet-stream');
+  return { ok: true, blob: new Blob([raw], { type: t }) };
+}
+
+function privatePath(v){
+  const p = CONFIG.privatePrefix;
+  const s = String(v || '');
+  return (p && s.indexOf(p) === 0) ? s.slice(p.length) : null;
+}
+
+function pagePath(v){
+  const p = CONFIG.pagePrefix;
+  const s = String(v || '');
+  return (p && s.indexOf(p) === 0) ? s.slice(p.length) : null;
+}
+
+function revokeBlobs(){
+  (STATE.blobs || []).forEach(u => { try { URL.revokeObjectURL(u); } catch (e) {} });
+  STATE.blobs = [];
+}
+
+function toast(msg, bad){
+  let el = document.getElementById('toast');
+  if (!el){ el = document.createElement('div'); el.id = 'toast'; document.body.appendChild(el); }
+  el.textContent = msg;
+  el.className = 'toast on' + (bad ? ' bad' : '');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(function(){ el.className = 'toast'; }, 2800);
+}
+
+/* root 可以是 iframe 元素，也可以是外壳里的 #doc 元素（Markdown 页面用） */
+function hydratePrivate(root, onPicturesDone){
+  let d;
+  try { d = root.contentDocument || root; } catch (e) { return; }
+  if (!d || !d.querySelectorAll) return;
+
+  // ① 保密图片：带令牌取回，换成 blob URL
+  const jobs = [];
+  Array.prototype.forEach.call(d.querySelectorAll('[data-private]'), function(el){
+    const p = el.getAttribute('data-private');
+    const attr = el.getAttribute('data-private-attr') || 'src';
+    el.removeAttribute('data-private');
+    el.removeAttribute('data-private-attr');
+    jobs.push(ghBlob(p, STATE.token).then(function(rs){
+      if (!rs.ok){
+        toast(rs.status === 401 ? '令牌失效了，保密图片取不回来' : '保密图片取回失败（HTTP ' + rs.status + '）', true);
+        return;
+      }
+      const u = URL.createObjectURL(rs.blob);
+      STATE.blobs.push(u);
+      el.setAttribute(attr, u);
+    }));
+  });
+
+  // ② 点击：保密附件走下载，跨页跳转交给外壳路由。只绑一次。
+  if (!d.__ghBound){
+    d.__ghBound = true;
+    d.addEventListener('click', async function(ev){
+      const t = ev.target;
+      const a = t && t.closest ? t.closest('a') : null;
+      if (!a) return;
+      const href = a.getAttribute('href') || '';
+
+      const pg = pagePath(href);
+      if (pg !== null){ ev.preventDefault(); location.hash = '#/' + encodeURIComponent(pg); return; }
+
+      const p = privatePath(href);
+      if (p === null) return;
+      ev.preventDefault();
+      if (a.dataset.busy) return;
+      a.dataset.busy = '1';
+
+      const name = decodeURIComponent(p.split('/').pop());
+      toast('正在取回 ' + name + ' …');
+      try {
+        const rs = await ghBlob(p, STATE.token);
+        if (!rs.ok){
+          toast(rs.status === 401 ? '令牌已失效，请重新授权' : '取回失败（HTTP ' + rs.status + '）', true);
+          return;
+        }
+        const u = URL.createObjectURL(rs.blob);
+        const can = document.createElement('a');
+        can.href = u; can.download = name;
+        document.body.appendChild(can); can.click(); can.remove();
+        setTimeout(function(){ URL.revokeObjectURL(u); }, 60000);
+        toast('已开始下载 ' + name);
+      } finally {
+        delete a.dataset.busy;
+      }
+    });
+  }
+
+  // 图片到位后 iframe 高度会变，重新量一次
+  if (jobs.length && onPicturesDone) {
+    Promise.all(jobs).then(function(){ onPicturesDone(); setTimeout(onPicturesDone, 300); });
+  }
+}
+
 /* HTML 页面为什么不直接 innerHTML 塞进来 —— 三个真实原因：
    ① 原页面的 <style> 会顺着 DOM 泄漏到外壳上，导航栏和正文字体全被改掉
    ② innerHTML 注入的 <script> 按 HTML 规范不会执行，页面的交互会静默失效
    ③ 原页面的页内锚点（href="#sec-3"）会和外壳的 hash 路由（#/path）打架，
       点一下就变成「找不到这一页」
    用 iframe 承载，这三个问题一次性隔离掉。 */
+/* CSS 里的 url() 只在 <style> 块和行内 style 属性里重写 —— 不做全局替换，
+   是为了绝不误伤 <script> 里拼 URL 的 JS 字符串。
+   注意：保密图片仍然不要写成 background-image，CSS 请求带不上令牌，取不回来。 */
+function rewriteCssUrls(css, b, bump){
+  return css.replace(
+    /url\(\s*(["']?)(?!https?:|\/\/|data:|blob:|@private\/)([^"')]+)\1\s*\)/gi,
+    function(m, q, val){
+      bump();
+      return 'url(' + q + b + val.replace(/^\/+/, '') + q + ')';
+    });
+}
+
 function rewriteRefs(html, base){
   if (base === undefined) base = CONFIG.resourceBase;
-  if (!base) return { html: html, count: 0 };
-  const b = String(base).replace(/\/+$/, '/');
+  const b = base ? String(base).replace(/\/+$/, '/') : '';
   let count = 0;
+  const bump = function(){ count++; };
+
   html = html.replace(
     /\b(src|href|poster|data-src)\s*=\s*(["'])(?!#|https?:|\/\/|data:|mailto:|tel:|javascript:|blob:)([^"']*)\2/gi,
     function(m, attr, q, val){
       if (!val) return m;
-      count++;
-      return attr + '=' + q + b + val + q;
+
+      // 保密资源（@private/）
+      const pv = privatePath(val);
+      if (pv !== null){
+        // <a href> 不点不发请求 —— 原样保留，点击时由 hydratePrivate 带令牌取回
+        if (attr.toLowerCase() === 'href') return m;
+        // <img src>/<video poster> 一进 DOM 就会请求，先摘下来挂到 data-private
+        return 'data-private="' + attrEsc(pv) + '" data-private-attr="' + attrEsc(attr) + '"';
+      }
+
+      // 公开资源：补上 resourceBase。
+      // 值开头的 / 要去掉 —— 否则 base 末尾的 / 和它拼在一起会变成双斜杠。
+      if (!b) return m;
+      bump();
+      return attr + '=' + q + b + val.replace(/^\/+/, '') + q;
     });
-  html = html.replace(
-    /url\(\s*(["']?)(?!https?:|\/\/|data:|blob:)([^"')]+)\1\s*\)/gi,
-    function(m, q, val){
-      count++;
-      return 'url(' + q + b + val + q + ')';
-    });
+
+  if (!b) return { html: html, count: count };
+
+  // ① <style> 块
+  html = html.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi,
+    function(m, open, css, close){ return open + rewriteCssUrls(css, b, bump) + close; });
+
+  // ② 行内 style="…"
+  html = html.replace(/(\sstyle\s*=\s*)(["'])([\s\S]*?)\2/gi,
+    function(m, pre, q, css){ return pre + q + rewriteCssUrls(css, b, bump) + q; });
+
   return { html: html, count: count };
 }
 
@@ -533,6 +744,7 @@ function buildHtmlFrame(raw, path){
     fit();
     setTimeout(fit, 400);
     setTimeout(fit, 1200);
+    hydratePrivate(frame, fit);   // 保密图片到位后再量一次高度
   });
   return frame;
 }
@@ -540,6 +752,7 @@ function buildHtmlFrame(raw, path){
 async function loadDoc(path){
   const doc = document.getElementById('doc');
   if (!doc) return;
+  revokeBlobs();   // 上一页的 blob URL 到这里就没用了，释放掉
   doc.innerHTML = '<div class="center"><span class="spin"></span><\/div>';
 
   const r = await fetchFile(path, STATE.token);
@@ -560,6 +773,7 @@ async function loadDoc(path){
     doc.appendChild(buildHtmlFrame(r.text, path));
   } else {
     doc.innerHTML = renderMd(r.text);
+    hydratePrivate(doc);          // Markdown 页面里也可能有 @private/ 的图片和附件
   }
 
   document.querySelectorAll('.nav a').forEach(a => {
@@ -582,6 +796,10 @@ document.getElementById('exitBtn').addEventListener('click', () => {
   localStorage.removeItem(CONFIG.tokenKey);
   Object.keys(localStorage).forEach(k => { if (k.indexOf(CONFIG.cachePrefix) === 0) localStorage.removeItem(k); });
   STATE.token = null; STATE.cache.clear();
+  /* site / path 也要一起清掉：下面那句 location.hash = '' 会排队触发一次
+     hashchange，若 STATE.site 还在，onHash 会试图重新加载文档。 */
+  STATE.site = null; STATE.path = null;
+  revokeBlobs();
   location.hash = '';
   renderLogin(null);
 });
