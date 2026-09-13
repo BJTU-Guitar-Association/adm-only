@@ -75,6 +75,8 @@ code{font-family:var(--mono);font-size:.88em;background:var(--soft);border:1px s
 .doc pre.code code{background:none;border:0;padding:0;font-size:inherit}
 .doc strong{font-weight:500}
 .doc img{max-width:100%;border-radius:var(--r)}
+.doc.wide{max-width:100%}
+.doc iframe.html-frame{width:100%;border:0;display:block;min-height:420px;background:#fff;border-radius:var(--r)}
 .tw{overflow-x:auto;margin:0 0 16px}
 .doc table{border-collapse:collapse;width:100%;font-size:13.5px}
 .doc th,.doc td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
@@ -130,6 +132,13 @@ const CONFIG = {
   repo:  'inner-content',
   branch: 'main',
   siteConfig: '_site.json',
+
+  /* HTML 页面里的「相对路径」资源（图片、附件下载）要去哪里取。
+     · 留空  → 不重写，相对路径会失效（图片全裂）
+     · 填地址 → 把 src="assets/x.jpg" 自动补成 <resourceBase>assets/x.jpg
+     注意：这只影响资源去哪取，不影响内容保密 —— 内容仓库里的 HTML 依然是私有的。 */
+  resourceBase: 'https://bjtu-guitar-association.github.io/.github.io/',
+
   tokenKey: 'ghgate.token.v1',
   cachePrefix: 'ghgate.cache.',
   cacheTtl: 5 * 60 * 1000
@@ -278,6 +287,22 @@ async function gh(path, token){
   return { status: res.status, data: data, headers: res.headers };
 }
 
+/* 单个文件超过 1MB 时，上面的默认响应只给元数据（encoding 会是 none，content 是空的）。
+   这时改用 raw 媒体类型直接取原始字节 —— 同一个端点，换成 Accept 头即可。
+   实测：4.24MB 的文件能完整拿到 4447036 字节；上限是 GitHub 的单文件硬限制 100MB。
+   Accept 属于 CORS 安全列表头，不会额外触发预检。 */
+async function ghRaw(path, token){
+  const res = await fetch(API + path, {
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Accept': 'application/vnd.github.raw+json'
+    },
+    cache: 'no-store'
+  });
+  if (!res.ok) return { status: res.status, text: null };
+  return { status: 200, text: await res.text() };
+}
+
 async function fetchFile(path, token){
   const key = CONFIG.cachePrefix + path;
   const hit = STATE.cache.get(path) || (() => {
@@ -296,12 +321,22 @@ async function fetchFile(path, token){
 
   if (r.status === 200 && r.data) {
     if (r.data.encoding === 'none' || !r.data.content) {
+      // 超过 1MB：不用默认响应，改用 raw 媒体类型重取一次
+      const big = await ghRaw(url, token);
+      if (big.status === 200 && typeof big.text === 'string' && big.text.length) {
+        const rec = { at: Date.now(), text: big.text, big: true };
+        STATE.cache.set(path, rec);
+        return { ok: true, text: big.text, cached: false, big: true };
+      }
       return { ok: false, code: 'toolarge', size: r.data.size || 0 };
     }
     const text = b64utf8(r.data.content);
     const rec = { at: Date.now(), text: text };
     STATE.cache.set(path, rec);
-    try { localStorage.setItem(key, JSON.stringify(rec)); } catch (e) {}
+    // 只把 1MB 以下的文本写进 localStorage —— 配额通常只有 5MB，大文件会把缓存挤爆
+    if (text.length < 512 * 1024) {
+      try { localStorage.setItem(key, JSON.stringify(rec)); } catch (e) {}
+    }
     return { ok: true, text: text, cached: false };
   }
   return { ok: false, code: r.status };
@@ -448,6 +483,60 @@ function renderDocs(){
   loadDoc(cur);
 }
 
+/* HTML 页面为什么不直接 innerHTML 塞进来 —— 三个真实原因：
+   ① 原页面的 <style> 会顺着 DOM 泄漏到外壳上，导航栏和正文字体全被改掉
+   ② innerHTML 注入的 <script> 按 HTML 规范不会执行，页面的交互会静默失效
+   ③ 原页面的页内锚点（href="#sec-3"）会和外壳的 hash 路由（#/path）打架，
+      点一下就变成「找不到这一页」
+   用 iframe 承载，这三个问题一次性隔离掉。 */
+function rewriteRefs(html, base){
+  if (base === undefined) base = CONFIG.resourceBase;
+  if (!base) return { html: html, count: 0 };
+  const b = String(base).replace(/\/+$/, '/');
+  let count = 0;
+  html = html.replace(
+    /\b(src|href|poster|data-src)\s*=\s*(["'])(?!#|https?:|\/\/|data:|mailto:|tel:|javascript:|blob:)([^"']*)\2/gi,
+    function(m, attr, q, val){
+      if (!val) return m;
+      count++;
+      return attr + '=' + q + b + val + q;
+    });
+  html = html.replace(
+    /url\(\s*(["']?)(?!https?:|\/\/|data:|blob:)([^"')]+)\1\s*\)/gi,
+    function(m, q, val){
+      count++;
+      return 'url(' + q + b + val + q + ')';
+    });
+  return { html: html, count: count };
+}
+
+function buildHtmlFrame(raw, path){
+  const frame = document.createElement('iframe');
+  frame.className = 'html-frame';
+  frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups allow-forms');
+  frame.setAttribute('title', path);
+  frame.srcdoc = rewriteRefs(raw, CONFIG.resourceBase).html;
+
+  /* iframe 不会自己长高，要量它的内容高度回填。图片是异步加载的，
+     所以量三次：load 时、400ms 后、1200ms 后。 */
+  const fit = function(){
+    try {
+      const d = frame.contentDocument;
+      if (!d) return;
+      const h = Math.max(
+        d.documentElement ? d.documentElement.scrollHeight : 0,
+        d.body ? d.body.scrollHeight : 0);
+      if (h > 0) frame.style.height = h + 'px';
+    } catch (e) {}
+  };
+  frame.addEventListener('load', function(){
+    fit();
+    setTimeout(fit, 400);
+    setTimeout(fit, 1200);
+  });
+  return frame;
+}
+
 async function loadDoc(path){
   const doc = document.getElementById('doc');
   if (!doc) return;
@@ -455,16 +544,23 @@ async function loadDoc(path){
 
   const r = await fetchFile(path, STATE.token);
   if (!r.ok){
+    doc.classList.remove('wide');
     if (r.code === 404)      doc.innerHTML = '<h1>找不到这一页<\/h1><p style="color:var(--fg2)">仓库里没有 <code>' + esc(path) + '<\/code>。检查 <code>' + esc(CONFIG.siteConfig) + '<\/code> 里的路径有没有写错。<\/p>';
     else if (r.code === 401) { localStorage.removeItem(CONFIG.tokenKey); renderLogin('令牌已失效，请重新授权。'); return; }
-    else if (r.code === 'toolarge') doc.innerHTML = '<h1>文件太大了<\/h1><p style="color:var(--fg2)">' + esc(path) + ' 有 ' + fmtBytes(r.size) + '，超过了接口单文件 1MB 的上限。<\/p>';
+    else if (r.code === 'toolarge') doc.innerHTML = '<h1>文件太大了<\/h1><p style="color:var(--fg2)">' + esc(path) + ' 有 ' + fmtBytes(r.size) + '，取不回来。GitHub 的单文件硬上限是 100MB。<\/p>';
     else doc.innerHTML = '<h1>读取失败<\/h1><p style="color:var(--fg2)">HTTP ' + esc(r.code) + '<\/p>';
     return;
   }
 
-  doc.innerHTML = /\.html?$/i.test(path)
-    ? r.text
-    : renderMd(r.text);
+  const isHtml = /\.html?$/i.test(path);
+  doc.classList.toggle('wide', isHtml);
+
+  if (isHtml){
+    doc.innerHTML = '';
+    doc.appendChild(buildHtmlFrame(r.text, path));
+  } else {
+    doc.innerHTML = renderMd(r.text);
+  }
 
   document.querySelectorAll('.nav a').forEach(a => {
     a.classList.toggle('on', decodeURIComponent(a.getAttribute('href').slice(2)) === path);
