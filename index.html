@@ -44,6 +44,7 @@ code{font-family:var(--mono);font-size:.88em;background:var(--soft);border:1px s
 
 /* 布局 */
 .cols{display:grid;grid-template-columns:236px minmax(0,1fr);align-items:start;min-height:calc(100vh - 54px)}
+.cols.bare{grid-template-columns:minmax(0,1fr)}
 .side{border-right:1px solid var(--line);padding:26px 16px 70px;position:sticky;top:54px;max-height:calc(100vh - 54px);overflow:auto}
 .side h4{margin:0 0 10px;padding:0 10px;font-size:11px;font-weight:500;letter-spacing:.08em;color:var(--fg3);text-transform:uppercase}
 .nav{display:flex;flex-direction:column;gap:1px}
@@ -529,14 +530,19 @@ function renderDocs(){
   document.getElementById('brandName').textContent = (STATE.site && STATE.site.title) || '内部资料站';
   document.getElementById('who').textContent = STATE.login ? '已授权 · ' + STATE.login : '';
 
+  /* 只有一页时不渲染左侧目录 —— 单页站点里导航没有意义。去掉后
+     内容区占满整宽（HTML 页面自带 wide 类，会撑到 100%）。 */
+  const single = nav.length <= 1;
+
   stage.innerHTML = ''
-  + '<div class="cols">'
-  +   '<aside class="side">'
-  +     '<h4>目录<\/h4>'
-  +     '<nav class="nav">' + nav.map(it =>
-          '<a href="#/' + encodeURIComponent(it.path) + '"' + (it.path === cur ? ' class="on"' : '') + '>'
-          + esc(it.label) + '<\/a>').join('') + '<\/nav>'
-  +   '<\/aside>'
+  + '<div class="cols' + (single ? ' bare' : '') + '">'
+  +   (single ? '' :
+        '<aside class="side">'
+      +   '<h4>目录<\/h4>'
+      +   '<nav class="nav">' + nav.map(it =>
+            '<a href="#/' + encodeURIComponent(it.path) + '"' + (it.path === cur ? ' class="on"' : '') + '>'
+            + esc(it.label) + '<\/a>').join('') + '<\/nav>'
+      + '<\/aside>')
   +   '<article class="doc" id="doc"><div class="center"><span class="spin"></span><\/div><\/article>'
   + '<\/div>';
 
@@ -747,7 +753,15 @@ function buildHtmlFrame(raw, path){
   frame.className = 'html-frame';
   frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups allow-forms');
   frame.setAttribute('title', path);
-  frame.srcdoc = rewriteRefs(raw, CONFIG.resourceBase).html;
+
+  /* 把当前登录名注入内站页面，供它显示在「退出」按钮左侧。
+     注入放在 rewriteRefs 之后，避免这段脚本被路径重写波及。 */
+  let html = rewriteRefs(raw, CONFIG.resourceBase).html;
+  const inject = '<script>window.__GH_USER__=' + JSON.stringify(STATE.login || '') + ';<\/script>';
+  html = /<head[^>]*>/i.test(html)
+    ? html.replace(/<head[^>]*>/i, function(m){ return m + inject; })
+    : inject + html;
+  frame.srcdoc = html;
 
   /* iframe 不会自己长高，要量它的内容高度回填。图片是异步加载的，
      所以量三次：load 时、400ms 后、1200ms 后。 */
