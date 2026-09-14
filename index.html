@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow,noarchive,noimageindex">
 <title>内部资料站</title>
-<link rel="icon" href="favicon-dark.png" type="image/png">
-<link rel="apple-touch-icon" href="favicon-dark.png">
+<link rel="icon" href="https://bjtu-guitar-association.github.io/adm-only/favicon-dark.png" type="image/png">
+<link rel="apple-touch-icon" href="https://bjtu-guitar-association.github.io/adm-only/favicon-dark.png">
 <style>
 *,*::before,*::after{box-sizing:border-box}
 :root{
@@ -34,7 +34,7 @@ code{font-family:var(--mono);font-size:.88em;background:var(--soft);border:1px s
 .btn:disabled{opacity:.5;cursor:not-allowed}
 
 /* 布局 */
-.cols{display:grid;grid-template-columns:236px minmax(0,1fr);align-items:start;min-height:calc(100vh - 54px)}
+.cols{display:grid;grid-template-columns:236px minmax(0,1fr);align-items:start;min-height:100vh}
 .cols.bare{grid-template-columns:minmax(0,1fr)}
 .side{border-right:1px solid var(--line);padding:26px 16px 70px;position:sticky;top:54px;max-height:calc(100vh - 54px);overflow:auto}
 .side h4{margin:0 0 10px;padding:0 10px;font-size:11px;font-weight:500;letter-spacing:.08em;color:var(--fg3);text-transform:uppercase}
@@ -67,8 +67,10 @@ code{font-family:var(--mono);font-size:.88em;background:var(--soft);border:1px s
 .doc pre.code code{background:none;border:0;padding:0;font-size:inherit}
 .doc strong{font-weight:500}
 .doc img{max-width:100%;border-radius:var(--r)}
-.doc.wide{max-width:100%}
-.doc iframe.html-frame{width:100%;border:0;display:block;min-height:420px;background:#fff;border-radius:var(--r)}
+/* HTML 页面要顶到边：不再给内边距，否则四周会围一圈白边；圆角也去掉，
+   否则铺满时四个角会露出底色。 */
+.doc.wide{max-width:100%;padding:0}
+.doc iframe.html-frame{width:100%;border:0;display:block;min-height:420px;background:#fff}
 .tw{overflow-x:auto;margin:0 0 16px}
 .doc table{border-collapse:collapse;width:100%;font-size:13.5px}
 .doc th,.doc td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
